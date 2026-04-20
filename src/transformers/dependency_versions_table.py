@@ -92,4 +92,5 @@ deps = {
     "opentelemetry-api": "opentelemetry-api",
     "opentelemetry-exporter-otlp": "opentelemetry-exporter-otlp",
     "opentelemetry-sdk": "opentelemetry-sdk",
+    "pytest-opentelemetry": "pytest-opentelemetry",
 }
