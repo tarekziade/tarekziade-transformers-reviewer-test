@@ -40,3 +40,4 @@ jobs:
           llm_api_key: ${{ secrets.LLM_API_KEY }}
           llm_api_base: ${{ secrets.LLM_API_BASE || 'https://router.huggingface.co/v1' }}
           llm_model: mistralai/Mistral-Small-4-119B-2603
+          max_diff_chars: '600000'
