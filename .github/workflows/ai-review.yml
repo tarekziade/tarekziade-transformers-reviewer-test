@@ -39,3 +39,4 @@ jobs:
         with:
           llm_api_key: ${{ secrets.LLM_API_KEY }}
           llm_api_base: ${{ secrets.LLM_API_BASE || 'https://router.huggingface.co/v1' }}
+          llm_model: mistralai/Devstral-Small-2-24B-Instruct-2512
