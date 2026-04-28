@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""Context-script invoked by tarekziade/ai-reviewer.
+
+ai-reviewer pipes a JSON document on stdin describing the PR (title,
+body, modified-file list); we respond with a JSON object on stdout:
+
+    {
+      "context": "<text injected into the reviewer prompt>",
+      "skip_files": ["<paths to drop from the diff>"]
+    }
+
+Both fields are optional; the reviewer treats them independently.
+
+For Transformers we use this to:
+
+1. Detect auto-generated model files (those carrying an
+   `automatically generated from` header) and tell the reviewer to
+   skip them — they are produced by `make fix-repo` from a sibling
+   `modular_*.py` and shouldn't be reviewed directly.
+2. Inject the minimum supported Python version, parsed from
+   `setup.py` (`SUPPORTED_PYTHON_VERSIONS[0]`), so the reviewer
+   doesn't suggest syntax newer than the floor.
+3. Inject excerpts of the `docs/source/en/` pages most relevant to
+   the touched files, so the reviewer can verify behavior matches the
+   documented contract.
+
+Failures degrade silently — a broken hook must not break review.
+"""
+
+import json
+import os
+import re
+import sys
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DOCS_ROOT = os.path.join(REPO_ROOT, "docs", "source", "en")
+EXCERPT_CHARS = 1200
+TOTAL_BUDGET = 7000  # leaves room inside ai-reviewer's ~8 KB cap
+
+GENERATED_MARKER = "automatically generated from"
+GENERATED_MARKER_SCAN_BYTES = 4000
+
+
+def parse_min_python_version() -> str | None:
+    setup_py = os.path.join(REPO_ROOT, "setup.py")
+    try:
+        with open(setup_py, "r", encoding="utf-8") as fh:
+            source = fh.read()
+    except OSError:
+        return None
+    m = re.search(
+        r"SUPPORTED_PYTHON_VERSIONS\s*=\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)",
+        source,
+    )
+    if not m:
+        return None
+    return f"3.{m.group(1)}"
+
+
+_LICENSE_HEADER_RE = re.compile(r"^<!--.*?-->\s*", re.DOTALL)
+
+
+def read_doc_excerpt(rel_path: str) -> str | None:
+    full = os.path.join(DOCS_ROOT, rel_path)
+    if not os.path.isfile(full):
+        return None
+    try:
+        with open(full, "r", encoding="utf-8") as fh:
+            content = fh.read()
+    except OSError:
+        return None
+    content = _LICENSE_HEADER_RE.sub("", content, count=1).lstrip()
+    if len(content) > EXCERPT_CHARS:
+        content = content[:EXCERPT_CHARS].rstrip() + "\n[... excerpt truncated ...]"
+    return content
+
+
+def model_name_from_path(path: str) -> str | None:
+    parts = path.split("/")
+    if len(parts) >= 4 and parts[:3] == ["src", "transformers", "models"]:
+        return parts[3]
+    return None
+
+
+def model_doc_candidates(model_name: str) -> list[str]:
+    """Doc filenames sometimes use kebab-case while dirs use snake_case."""
+    return [
+        f"model_doc/{model_name}.md",
+        f"model_doc/{model_name.replace('_', '-')}.md",
+    ]
+
+
+def detect_generated(paths: set[str]) -> tuple[set[str], set[str]]:
+    """Identify which `paths` are auto-generated, plus modular files in the diff.
+
+    A file is treated as generated if it lives in a model directory, is
+    NOT a `modular_*.py`, and either:
+    - the working-copy file (default-branch version, in Action mode)
+      contains the 'automatically generated from' header in its first
+      few KB, OR
+    - a sibling `modular_*.py` is present in the same model directory
+      AND is also in this PR (covers new-model PRs where the
+      regenerated file doesn't exist on disk yet).
+
+    Returns (generated_paths, modular_paths_in_diff). The modular set is
+    used downstream to phrase context guidance precisely.
+    """
+    modular_in_diff: set[str] = set()
+    model_dirs_with_modular_in_diff: set[str] = set()
+    for p in paths:
+        parts = p.split("/")
+        if (
+            len(parts) >= 5
+            and parts[:3] == ["src", "transformers", "models"]
+            and parts[4].startswith("modular_")
+            and parts[4].endswith(".py")
+        ):
+            modular_in_diff.add(p)
+            model_dirs_with_modular_in_diff.add("/".join(parts[:4]))
+
+    generated: set[str] = set()
+    for p in paths:
+        parts = p.split("/")
+        if len(parts) < 5 or parts[:3] != ["src", "transformers", "models"]:
+            continue
+        leaf = parts[4]
+        if not leaf.endswith(".py") or leaf.startswith("modular_"):
+            continue
+        model_dir = "/".join(parts[:4])
+
+        # Heuristic 1: read the working-copy version and look for the marker.
+        full = os.path.join(REPO_ROOT, p)
+        if os.path.isfile(full):
+            try:
+                with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                    head = fh.read(GENERATED_MARKER_SCAN_BYTES)
+                if GENERATED_MARKER in head:
+                    generated.add(p)
+                    continue
+            except OSError:
+                pass
+
+        # Heuristic 2: a sibling modular_*.py is in this PR.
+        if model_dir in model_dirs_with_modular_in_diff:
+            generated.add(p)
+
+    return generated, modular_in_diff
+
+
+def pick_docs(paths: set[str]) -> list[str]:
+    picks: list[str] = []
+
+    def add(rel: str) -> None:
+        if rel not in picks:
+            picks.append(rel)
+
+    touched_modular = any(
+        "/modular_" in p and p.endswith(".py") for p in paths
+    )
+    touched_models = any(model_name_from_path(p) for p in paths)
+    if touched_modular or touched_models:
+        add("modular_transformers.md")
+
+    new_model_files = any(
+        model_name_from_path(p) and p.endswith("__init__.py") for p in paths
+    )
+    if new_model_files:
+        add("add_new_model.md")
+
+    for p in paths:
+        name = model_name_from_path(p)
+        if not name:
+            continue
+        for cand in model_doc_candidates(name):
+            add(cand)
+
+    if any(
+        p == "src/transformers/cache_utils.py" or "/generation/cache" in p
+        for p in paths
+    ):
+        add("cache_explanation.md")
+        add("kv_cache.md")
+
+    if any(
+        p == "src/transformers/trainer.py"
+        or p.startswith("src/transformers/trainer_")
+        for p in paths
+    ):
+        add("trainer.md")
+        add("trainer_callbacks.md")
+
+    if any(p.startswith("src/transformers/generation/") for p in paths):
+        add("generation_strategies.md")
+        add("llm_tutorial.md")
+
+    if any(p.startswith("src/transformers/pipelines/") for p in paths):
+        add("main_classes/pipelines.md")
+
+    quant_subs = sorted(
+        {p.split("/")[3] for p in paths
+         if p.startswith("src/transformers/quantizers/") and len(p.split("/")) >= 5}
+    )
+    for sub in quant_subs:
+        add(f"quantization/{sub}.md")
+    if quant_subs:
+        add("main_classes/quantization.md")
+
+    if any("tokenization_" in p for p in paths):
+        add("main_classes/tokenizer.md")
+        add("tokenizer_summary.md")
+
+    if any(p.startswith("tests/") or p == "conftest.py" for p in paths):
+        add("testing.md")
+
+    return picks
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        print(f"context-script: bad JSON on stdin: {exc}", file=sys.stderr)
+        return 1
+
+    files = payload.get("files") or []
+    paths = {f["path"] for f in files if isinstance(f, dict) and f.get("path")}
+
+    generated, modular_in_diff = detect_generated(paths)
+
+    sections: list[str] = []
+
+    min_py = parse_min_python_version()
+    if min_py:
+        sections.append(
+            f"Minimum supported Python version: **{min_py}** "
+            f"(parsed from `setup.py` `SUPPORTED_PYTHON_VERSIONS[0]`).\n\n"
+            f"Treat this as a hard floor: do not request changes that rely on "
+            f"syntax or standard-library features introduced after Python "
+            f"{min_py}. Conversely, suggestions that *backport* code to "
+            f"versions older than {min_py} are also out of scope."
+        )
+
+    if generated or modular_in_diff:
+        sections.append(
+            "Modular workflow note (Transformers-specific):\n"
+            "- Files under `src/transformers/models/<name>/` other than "
+            "`modular_*.py` are auto-generated by `make fix-repo` from the "
+            "sibling modular source. They carry an "
+            "'automatically generated from' header.\n"
+            "- The reviewer has been instructed to skip the auto-generated "
+            "files in this PR (listed below). Their presence in the diff is "
+            "the **expected outcome** of editing a `modular_*.py` and "
+            "regenerating — do not flag it as bloat or a rule violation.\n"
+            "- If you suspect a generated file was hand-edited (for example, "
+            "the diff in a generated file does NOT correspond to anything in "
+            f"the modular source), say so in the summary. Modular sources "
+            f"touched in this PR: "
+            f"{sorted(modular_in_diff) if modular_in_diff else 'none'}.\n"
+            f"- Auto-generated files excluded from review: "
+            f"{sorted(generated) if generated else 'none'}.\n"
+            "- Reference: `docs/source/en/modular_transformers.md`."
+        )
+
+    if paths:
+        candidates = pick_docs(paths)
+        excerpts: list[str] = []
+        used = sum(len(s) for s in sections)
+        for rel in candidates:
+            excerpt = read_doc_excerpt(rel)
+            if excerpt is None:
+                continue
+            block = f"\n\n## docs/source/en/{rel}\n\n{excerpt}"
+            if used + len(block) > TOTAL_BUDGET:
+                excerpts.append(
+                    f"\n\n[further matched docs omitted to stay within "
+                    f"{TOTAL_BUDGET}-char budget]"
+                )
+                break
+            excerpts.append(block)
+            used += len(block)
+        if excerpts:
+            sections.append(
+                "\nRelevant documentation excerpts (from `docs/source/en/`, "
+                "default branch). Use these to verify the patch matches the "
+                "documented contract; cite them in inline comments where "
+                "useful." + "".join(excerpts)
+            )
+
+    context_text = "\n\n".join(sections).strip()
+
+    out: dict = {}
+    if context_text:
+        out["context"] = context_text
+    if generated:
+        out["skip_files"] = sorted(generated)
+
+    if not out:
+        return 0
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
