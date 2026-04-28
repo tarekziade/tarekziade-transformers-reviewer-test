@@ -35,6 +35,9 @@ jobs:
         github.event.comment.author_association == 'COLLABORATOR'))
     runs-on: ubuntu-latest
     steps:
+      - name: Check out repository (default branch — for .ai/context-script)
+        uses: actions/checkout@v4
+
       - uses: tarekziade/ai-reviewer@main
         with:
           llm_api_key: ${{ secrets.LLM_API_KEY }}
