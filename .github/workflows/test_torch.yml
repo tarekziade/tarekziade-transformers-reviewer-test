@@ -44,6 +44,10 @@ jobs:
           ref: ${{ steps.meta.outputs.checkout_ref }}
           fetch-depth: 0
 
+      - name: Mark workspace as safe for git
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Ensure local main ref exists for tests_fetcher
         shell: bash
         run: |
@@ -115,6 +119,10 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           fetch-depth: 1
+
+      - name: Mark workspace as safe for git
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - uses: actions/download-artifact@v4
         with:
