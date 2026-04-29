@@ -72,6 +72,24 @@ jobs:
         shell: bash
         run: python utils/tests_fetcher.py --fetch_all | tee tests_fetched_summary.txt
 
+      - name: Seed a small fallback sample on main
+        if: ${{ github.ref == 'refs/heads/main' }}
+        shell: bash
+        run: |
+          if [ -s test_preparation/tests_torch_test_list.txt ]; then
+            echo "tests_torch already has selected entries."
+            exit 0
+          fi
+
+          cat > test_preparation/tests_torch_test_list.txt <<'EOF'
+          tests/models/albert/test_modeling_albert.py::AlbertModelTest::test_config
+          tests/models/albert/test_modeling_albert.py::AlbertModelTest::test_model
+          tests/models/bert_generation/test_modeling_bert_generation.py::BertGenerationEncoderTest::test_config
+          tests/models/bert_generation/test_modeling_bert_generation.py::BertGenerationEncoderTest::test_model
+          EOF
+          echo "Seeded fallback tests_torch sample for main:"
+          cat test_preparation/tests_torch_test_list.txt
+
       - name: Check whether test_torch has work
         id: test_list
         shell: bash
