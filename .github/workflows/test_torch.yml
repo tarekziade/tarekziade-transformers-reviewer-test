@@ -1,0 +1,277 @@
+name: test_torch
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      fetch_all:
+        description: Run the full upstream test_torch selection
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-torch-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+  OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    container:
+      image: huggingface/transformers-quality
+    outputs:
+      checkout_ref: ${{ steps.meta.outputs.checkout_ref }}
+      has_tests: ${{ steps.test_list.outputs.has_tests }}
+    steps:
+      - name: Resolve checkout ref
+        id: meta
+        shell: bash
+        run: |
+          echo "checkout_ref=${{ github.event.pull_request.head.sha || github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.checkout_ref }}
+          fetch-depth: 0
+
+      - name: Ensure local main ref exists for tests_fetcher
+        shell: bash
+        run: |
+          git fetch origin main --depth=1
+          git branch -f main origin/main
+
+      - name: Install repository for test selection
+        shell: bash
+        run: uv pip install -U -e .
+
+      - name: Create test preparation directory
+        shell: bash
+        run: mkdir -p test_preparation
+
+      - name: Fetch impacted tests
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.fetch_all != 'true' }}
+        shell: bash
+        run: python utils/tests_fetcher.py | tee tests_fetched_summary.txt
+
+      - name: Fetch full test_torch selection
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.fetch_all == 'true' }}
+        shell: bash
+        run: python utils/tests_fetcher.py --fetch_all | tee tests_fetched_summary.txt
+
+      - name: Check whether test_torch has work
+        id: test_list
+        shell: bash
+        run: |
+          if [ -s test_preparation/tests_torch_test_list.txt ]; then
+            echo "has_tests=true" >> "$GITHUB_OUTPUT"
+            grep -cve '^[[:space:]]*$' test_preparation/tests_torch_test_list.txt
+          else
+            echo "has_tests=false" >> "$GITHUB_OUTPUT"
+            echo "No tests_torch_test_list.txt generated."
+          fi
+
+      - name: Upload test preparation
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test_torch_preparation
+          path: |
+            test_preparation
+            tests_fetched_summary.txt
+          if-no-files-found: ignore
+
+  run_test_torch:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.has_tests == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    container:
+      image: huggingface/transformers-torch-light
+    env:
+      HF_HOME: /tmp/huggingface
+      HF_TOKEN: ${{ secrets.HF_HUB_READ_TOKEN }}
+      OMP_NUM_THREADS: "1"
+      TRANSFORMERS_IS_CI: "true"
+      PYTEST_TIMEOUT: "120"
+      RUN_PIPELINE_TESTS: "false"
+      DISABLE_SAFETENSORS_CONVERSION: "true"
+      NETWORK_DEBUG_REPORT: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: test_torch_preparation
+          path: test_preparation_artifact
+
+      - name: Restore test preparation files
+        shell: bash
+        run: |
+          mkdir -p test_preparation
+          cp -R test_preparation_artifact/test_preparation/. test_preparation/
+          cp test_preparation_artifact/tests_fetched_summary.txt . 2>/dev/null || true
+
+      - name: Set runtime environment
+        shell: bash
+        run: |
+          mkdir -p "$HF_HOME/hub"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "RUN_FLAKY=false" >> "$GITHUB_ENV"
+          else
+            echo "RUN_FLAKY=true" >> "$GITHUB_ENV"
+          fi
+          echo "TRANSFORMERS_TEST_OTEL_JOB_NAME=tests_torch_shard_${{ matrix.shard }}" >> "$GITHUB_ENV"
+
+      - name: Install runtime dependencies
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y curl pigz
+          uv pip install .
+          uv pip install git+https://github.com/ydshieh/pytest.git@8.4.1-ydshieh
+          uv pip install pytest-random-order
+          uv pip install 'transformers-ci[otel] @ git+https://github.com/huggingface/transformers-ci@main'
+
+      - name: Show installed libraries and their size
+        shell: bash
+        run: |
+          du -h -d 1 "$(pip -V | cut -d ' ' -f 4 | sed 's/pip//g')" | grep -vE "dist-info|_distutils_hack|__pycache__" | sort -h | tee installed_sizes.txt || true
+
+      - name: Show installed libraries and their versions
+        shell: bash
+        run: pip list --format=freeze | tee installed.txt || true
+
+      - name: Create test-results directory
+        shell: bash
+        run: mkdir -p test-results
+
+      - name: Split tests for this shard
+        id: split
+        shell: bash
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_COUNT: 6
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          shard_index = int(os.environ["SHARD_INDEX"])
+          shard_count = int(os.environ["SHARD_COUNT"])
+          test_file = Path("test_preparation/tests_torch_test_list.txt")
+          tests = [line.strip() for line in test_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+          selected_tests = tests[shard_index::shard_count]
+          Path("splitted_tests.txt").write_text(
+              "\n".join(selected_tests) + ("\n" if selected_tests else ""), encoding="utf-8"
+          )
+          print("\n".join(selected_tests))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output_file:
+              output_file.write(f"count={len(selected_tests)}\n")
+          PY
+
+      - name: Fetch hub objects before pytest
+        if: ${{ steps.split.outputs.count != '0' }}
+        shell: bash
+        run: |
+          cp -r /test_data/* . 2>/dev/null || true
+          python3 utils/fetch_hub_objects_for_ci.py
+
+      - name: Download and unzip hub cache
+        if: ${{ steps.split.outputs.count != '0' }}
+        shell: bash
+        run: |
+          curl -L -o huggingface-cache.tar.gz https://huggingface.co/datasets/hf-internal-testing/hf_hub_cache/resolve/main/huggingface-cache.tar.gz
+          tar --use-compress-program="pigz -d -p 8" -xf huggingface-cache.tar.gz
+          if [ -d hub ]; then
+            mv -n hub/* "$HF_HOME/hub/" || true
+          fi
+          ls -la "$HF_HOME/hub/" || true
+
+      - name: Run test_torch shard
+        if: ${{ steps.split.outputs.count != '0' }}
+        shell: bash
+        run: |
+          RERUN_PATTERN="OSError|Timeout|ConnectionError|FileNotFoundError|PIL.UnidentifiedImageError|HTTPError|AssertionError: Tensor-likes are not close!|TypeError: expected str, bytes or os.PathLike object, not NoneType|TypeError: stat: path should be string, bytes, os.PathLike or integer, not NoneType|Converting from Tiktoken failed|KeyError: <class |TypeError: not a string"
+          mapfile -t TESTS < splitted_tests.txt
+          (
+            configure-ci-otel --job-name "$TRANSFORMERS_TEST_OTEL_JOB_NAME" -- \
+              python3 -m pytest \
+              -m 'not generate' \
+              -n 8 \
+              -p no:warning \
+              -o junit_family=xunit1 \
+              --junitxml=test-results/junit.xml \
+              --reruns 5 \
+              --reruns-delay 2 \
+              --only-rerun "(${RERUN_PATTERN})" \
+              --max-worker-restart=0 \
+              -vvv \
+              -rsfE \
+              --random-order-bucket=module \
+              --random-order-seed="${GITHUB_RUN_NUMBER}" \
+              --make-reports=tests_torch_${{ matrix.shard }} \
+              "${TESTS[@]}" | tee tests_output.txt
+          )
+
+      - name: Check for test crashes
+        if: ${{ always() && steps.split.outputs.count != '0' }}
+        shell: bash
+        run: |
+          if [ ! -f tests_output.txt ]; then
+            echo "ERROR: tests_output.txt does not exist - tests may not have run properly"
+            exit 1
+          elif grep -q "crashed and worker restarting disabled" tests_output.txt; then
+            echo "ERROR: Worker crash detected in test output"
+            echo "Found: crashed and worker restarting disabled"
+            exit 1
+          else
+            echo "Tests output file exists and no worker crashes detected"
+          fi
+
+      - name: Expand to show skipped tests
+        if: ${{ always() && steps.split.outputs.count != '0' }}
+        shell: bash
+        run: python3 .circleci/parse_test_outputs.py --file tests_output.txt --skip
+
+      - name: "Failed tests: show reasons"
+        if: ${{ always() && steps.split.outputs.count != '0' }}
+        shell: bash
+        run: python3 .circleci/parse_test_outputs.py --file tests_output.txt --fail
+
+      - name: Errors
+        if: ${{ always() && steps.split.outputs.count != '0' }}
+        shell: bash
+        run: python3 .circleci/parse_test_outputs.py --file tests_output.txt --errors
+
+      - name: Upload test shard artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test_torch_shard_${{ matrix.shard }}
+          path: |
+            test-results
+            reports
+            tests_output.txt
+            splitted_tests.txt
+            installed.txt
+            installed_sizes.txt
+            network_debug_report.json
+            tests_fetched_summary.txt
+          if-no-files-found: ignore
