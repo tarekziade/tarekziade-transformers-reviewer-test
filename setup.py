@@ -85,7 +85,7 @@ _deps = [
     "filelock",
     "fugashi>=1.0",
     "GitPython<3.1.19",
-    "hf-doc-builder",
+    "hf-doc-builder>=0.3.0",
     "huggingface-hub>=1.5.0,<2.0",
     "ipadic>=1.0.0,<2.0",
     "jinja2>=3.1.0",
@@ -124,9 +124,6 @@ _deps = [
     "rjieba",
     "rouge-score!=0.0.7,!=0.0.8,!=0.1,!=0.1.1",
     "ruff==0.14.10",
-    # When bumping `transformers-mlinter`, sync repo-local rule overrides from
-    # `utils/rules.toml` back into the released package.
-    "transformers-mlinter==0.1.1",
     "ty==0.0.20",
     # `sacrebleu` not used in `transformers`. However, it is needed in several tests, when a test calls
     # `evaluate.load("sacrebleu")`. This metric is used in the examples that we use to test the `Trainer` with, in the
@@ -185,10 +182,7 @@ if PYTHON_MINOR_VERSION < 13:
     extras["audio"] += deps_list("kenlm")
 extras["video"] = deps_list("av")
 extras["timm"] = deps_list("timm")
-extras["quality"] = deps_list(
-    "datasets", "ruff", "GitPython", "urllib3", "libcst", "rich", "ty", "tomli", "transformers-mlinter"
-)
-extras["docs"] = deps_list("hf-doc-builder")
+extras["quality"] = deps_list("datasets", "ruff", "GitPython", "urllib3", "libcst", "rich", "ty", "tomli")
 extras["kernels"] = deps_list("kernels")
 extras["sentencepiece"] = deps_list("sentencepiece", "protobuf")
 extras["tiktoken"] = deps_list("tiktoken", "blobfile")
@@ -241,7 +235,6 @@ extras["testing"] = (
         "sacrebleu",  # needed in trainer tests, see references to `run_translation.py`
         "filelock",  # filesystem locks, e.g., to prevent parallel downloads
     )
-    + extras["docs"]
     + extras["quality"]
     + extras["retrieval"]
     + extras["sentencepiece"]
@@ -299,10 +292,8 @@ class DepsTableUpdateCommand(Command):
         pass
 
     def run(self):
-        if SUPPORTED_PYTHON_VERSIONS[0] > PYTHON_MINOR_VERSION:
-            print(
-                f"Table updated only when running 3.{SUPPORTED_PYTHON_VERSIONS[0]}.x, detected version is {sys.version}."
-            )
+        if SUPPORTED_PYTHON_VERSIONS[0] != PYTHON_MINOR_VERSION:
+            print(f"Table updated only when running 3.{SUPPORTED_PYTHON_VERSIONS[0]}.x")
             return
 
         entries = "\n".join([f'    "{k}": "{v}",' for k, v in deps.items()])
@@ -332,7 +323,7 @@ if __name__ == "__main__":
 
     setup(
         name="transformers",
-        version="5.8.0.dev0",  # expected format is one of x.y.z.dev0, or x.y.z.rc1 or x.y.z (no to dashes, yes to dots)
+        version="5.5.0.dev0",  # expected format is one of x.y.z.dev0, or x.y.z.rc1 or x.y.z (no to dashes, yes to dots)
         author="The Hugging Face team (past and future) with the help of all our contributors (https://github.com/huggingface/transformers/graphs/contributors)",
         author_email="transformers@huggingface.co",
         description="Transformers: the model-definition framework for state-of-the-art machine learning models in text, vision, audio, and multimodal models, for both inference and training.",
@@ -347,7 +338,10 @@ if __name__ == "__main__":
         package_data={"": ["**/*.cu", "**/*.cpp", "**/*.cuh", "**/*.h", "**/*.pyx", "py.typed"]},
         zip_safe=False,
         extras_require=extras,
-        entry_points={"console_scripts": ["transformers=transformers.cli.transformers:main"]},
+        entry_points={
+            "console_scripts": ["transformers=transformers.cli.transformers:main"],
+            "hf.skills": ["transformers=transformers.cli.agentic._skill_derive:derive_skill_from_cli"],
+        },
         python_requires=python_requires,
         install_requires=list(install_requires),
         classifiers=[
