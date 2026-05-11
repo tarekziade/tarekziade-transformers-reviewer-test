@@ -1,0 +1,15 @@
+{
+  "helpers": [
+    {
+      "name": "mlinter",
+      "description": "Run the Transformers model linter for new-model and model-wiring pull requests. Use it when model files, configuration, tokenizers, processors, or model docs are added or changed. Pass only the narrow CLI arguments needed for the files or checks you are verifying.",
+      "command": [
+        "mlinter"
+      ],
+      "allow_args": true,
+      "max_args": 8,
+      "timeout_seconds": 30,
+      "install": ["pip", "install", "transformers-mlinter"]
+    }
+  ]
+}
